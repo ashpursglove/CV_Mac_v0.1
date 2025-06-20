@@ -1,81 +1,111 @@
 #!/usr/bin/env python3
 """
-list_usb_devices.py
+usb_cam_viewer.py
 
-Query macOS for USB devices via `system_profiler`, parse the JSON output,
-and print a friendly, indented list of every device and its key properties.
+A PyQt5 application that shows a live video feed from a USB camera
+(using OpenCV). Replace `camera_index` if your device isn’t at 0.
 """
 
-import subprocess
-import json
 import sys
+import cv2
+import numpy as np
+from PyQt5.QtCore import QTimer, Qt
+from PyQt5.QtGui import QImage, QPixmap
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QLabel, QPushButton,
+    QVBoxLayout, QHBoxLayout, QMessageBox
+)
 
-# Which fields to show (if present)
-DESIRED_FIELDS = [
-    ('manufacturer', 'Manufacturer'),
-    ('vendor_id',    'Vendor ID'),
-    ('product_id',   'Product ID'),
-    ('serial_num',   'Serial Number'),
-    ('location_id',  'Location ID'),
-    ('version',      'Version'),
-    ('speed',        'Speed'),
-    ('bus_power',    'Bus Power'),
-    ('current_available', 'Current Available'),
-    ('built_in',     'Built-In'),
-]
+class CameraViewer(QWidget):
+    def __init__(self, camera_index=0, fps=30):
+        super().__init__()
+        self.camera_index = camera_index
+        self.fps = fps
 
-def get_usb_json():
-    """Run system_profiler to get SPUSBDataType as JSON."""
-    try:
-        proc = subprocess.run(
-            ["system_profiler", "SPUSBDataType", "-json"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=True,
-            text=True
-        )
-    except subprocess.CalledProcessError as e:
-        print("Error running system_profiler:", e.stderr.strip(), file=sys.stderr)
-        sys.exit(1)
-    return json.loads(proc.stdout)
+        # --- UI SETUP ---
+        self.setWindowTitle("USB Camera Live Feed")
+        self.video_label = QLabel("Initializing camera...")
+        self.video_label.setAlignment(Qt.AlignCenter)
 
-def flatten_devices(items, depth=0, out=None):
-    """
-    Recursively walk a list of items from system_profiler JSON,
-    collecting each device node into `out` along with its depth.
-    """
-    if out is None:
-        out = []
-    for dev in items:
-        out.append((depth, dev))
-        # child devices live in '_items'
-        for child_list_key in ['_items', 'usb_children']:
-            if child_list_key in dev:
-                flatten_devices(dev[child_list_key], depth+1, out)
-    return out
+        self.start_btn = QPushButton("Start")
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.setEnabled(False)
 
-def print_devices(flat_list):
-    """Print each device in order, with indentation and desired fields."""
-    for depth, dev in flat_list:
-        indent = "  " * depth
-        name = dev.get('_name') or dev.get('name') or "<Unknown Device>"
-        print(f"{indent}• {name}")
-        for key, label in DESIRED_FIELDS:
-            if key in dev:
-                print(f"{indent}    {label}: {dev[key]}")
-        print()  # blank line between devices
+        btn_layout = QHBoxLayout()
+        btn_layout.addWidget(self.start_btn)
+        btn_layout.addWidget(self.stop_btn)
+
+        main_layout = QVBoxLayout()
+        main_layout.addWidget(self.video_label)
+        main_layout.addLayout(btn_layout)
+        self.setLayout(main_layout)
+
+        # --- SIGNALS ---
+        self.start_btn.clicked.connect(self.start)
+        self.stop_btn.clicked.connect(self.stop)
+
+        # --- TIMER for frame updates ---
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.update_frame)
+
+        # VideoCapture object (not yet opened)
+        self.cap = None
+
+    def start(self):
+        """Open the camera and start the update timer."""
+        if self.cap is None:
+            self.cap = cv2.VideoCapture(self.camera_index, cv2.CAP_ANY)
+        if not self.cap.isOpened():
+            QMessageBox.critical(self, "Error", f"Cannot open camera #{self.camera_index}")
+            return
+
+        self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        interval_ms = int(1000 / self.fps)
+        self.timer.start(interval_ms)
+
+    def stop(self):
+        """Stop timer and release camera."""
+        self.timer.stop()
+        if self.cap and self.cap.isOpened():
+            self.cap.release()
+        self.cap = None
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.video_label.setText("Camera stopped.")
+
+    def update_frame(self):
+        """Grab a frame from the camera and display it."""
+        ret, frame = self.cap.read()
+        if not ret:
+            # error or camera disconnected
+            self.stop()
+            QMessageBox.warning(self, "Warning", "Failed to read frame from camera.")
+            return
+
+        # Convert BGR (OpenCV) → RGB (Qt)
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb_frame.shape
+        bytes_per_line = ch * w
+
+        # Build QImage and set on label
+        qimg = QImage(rgb_frame.data, w, h, bytes_per_line, QImage.Format_RGB888)
+        pixmap = QPixmap.fromImage(qimg)
+        self.video_label.setPixmap(pixmap.scaled(
+            self.video_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+        ))
+
+    def closeEvent(self, event):
+        """Ensure camera is released on window close."""
+        self.stop()
+        event.accept()
 
 def main():
-    data = get_usb_json()
-    # system_profiler nests USB info under SPUSBDataType → list
-    usb_list = data.get('SPUSBDataType', [])
-    if not usb_list:
-        print("No USB data found.", file=sys.stderr)
-        sys.exit(1)
-
-    flat = flatten_devices(usb_list)
-    print("\nDetected USB devices:\n")
-    print_devices(flat)
+    app = QApplication(sys.argv)
+    viewer = CameraViewer(camera_index=0, fps=30)
+    viewer.resize(800, 600)
+    viewer.show()
+    sys.exit(app.exec_())
 
 if __name__ == "__main__":
     main()
